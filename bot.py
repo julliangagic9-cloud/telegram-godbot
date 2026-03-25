@@ -1,4 +1,4 @@
-import asyncio, sqlite3, json, os, io
+import asyncio, sqlite3, json, os, aiohttp
 from datetime import datetime, timedelta
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
@@ -7,7 +7,6 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from fpdf import FPDF
 
 # --- CONFIGURATION ---
 TOKEN = os.getenv("TOKEN")
@@ -19,53 +18,142 @@ dp = Dispatcher()
 # --- DATABASE ---
 conn = sqlite3.connect("bot.db")
 cursor = conn.cursor()
-# Table des utilisateurs (Accès)
 cursor.execute("CREATE TABLE IF NOT EXISTS users (user_id INTEGER PRIMARY KEY, expires_at TEXT)")
-# Table des brouillons (Sauvegarde automatique)
-cursor.execute("CREATE TABLE IF NOT EXISTS drafts (user_id INTEGER PRIMARY KEY, data TEXT)")
+cursor.execute("CREATE TABLE IF NOT EXISTS searches (id INTEGER PRIMARY KEY, user_id INTEGER, data TEXT, created_at TEXT)")
 conn.commit()
 
-# --- FSM ---
+# --- FSM & MEMORY ---
 class Form(StatesGroup):
     waiting_input = State()
 
-# --- FONCTIONS DB ---
+user_searches = {}
+semaphore = asyncio.Semaphore(5)
+
+# --- UTILS ---
 def is_authorized(uid):
     cursor.execute("SELECT expires_at FROM users WHERE user_id=?", (uid,))
     r = cursor.fetchone()
     return r and datetime.now() < datetime.fromisoformat(r[0])
 
-def save_draft(uid, data):
-    cursor.execute("INSERT OR REPLACE INTO drafts (user_id, data) VALUES (?, ?)", (uid, json.dumps(data)))
-    conn.commit()
+def get_panel_text(m: types.Message, data: dict):
+    """Génère le texte du panel avec les champs remplis ou vides"""
+    text = (
+        "🔍 **PANEL RECHERCHE | CIVIL**\n\n"
+        f"👤 **Utilisateur :** {m.from_user.full_name}\n"
+        f"🆔 **ID :** `{m.from_user.id}`\n\n"
+        "**Choisis un champ** 👇"
+    )
+    return text
 
-def load_draft(uid):
-    cursor.execute("SELECT data FROM drafts WHERE user_id=?", (uid,))
-    row = cursor.fetchone()
-    return json.loads(row[0]) if row else {}
+def kb_main():
+    builder = InlineKeyboardBuilder()
+    buttons = [
+        ("👤 Nom", "f_nom"), ("📝 Prénom", "f_prenom"),
+        ("🎂 Année", "f_annee"), ("🏠 Adresse", "f_adresse"),
+        ("📮 Code postal", "f_cp"), ("🏙️ Ville", "f_ville"),
+        ("📧 Email", "f_email"), ("📱 Téléphone", "f_tel")
+    ]
+    for text, data in buttons:
+        builder.button(text=text, callback_data=data)
+    builder.adjust(2)
+    builder.row(types.InlineKeyboardButton(text="🔄 Civil / Network", callback_data="switch"))
+    builder.row(types.InlineKeyboardButton(text="🚀 Lancer recherche", callback_data="run"))
+    builder.row(types.InlineKeyboardButton(text="🧹 Effacer", callback_data="clear"))
+    builder.row(
+        types.InlineKeyboardButton(text="👤 Compte", callback_data="account"),
+        types.InlineKeyboardButton(text="🛒 Boutique", callback_data="shop")
+    )
+    return builder.as_markup()
 
-def clear_draft(uid):
-    cursor.execute("DELETE FROM drafts WHERE user_id=?", (uid,))
-    conn.commit()
-
-# --- GENERATEURS DE RAPPORTS ---
-def generate_pdf_report(uid, data):
-    pdf = FPDF()
-    pdf.add_page()
-    pdf.set_font("Helvetica", "B", 20)
-    pdf.cell(0, 20, "RAPPORT D'INVESTIGATION", ln=True, align='C')
-    pdf.set_draw_color(200, 200, 200)
-    pdf.line(10, 30, 200, 30)
-    pdf.ln(10)
+# --- HANDLERS ---
+@dp.message(Command("start"))
+async def cmd_start(m: types.Message):
+    if not is_authorized(m.from_user.id):
+        return await m.answer("🔒 **Accès refusé**\n\nActive une clé avec :\n`/claim TA_CLE`")
     
-    pdf.set_font("Helvetica", "I", 10)
-    pdf.cell(0, 7, f"ID Dossier: #OSINT-{uid}", ln=True)
-    pdf.cell(0, 7, f"Généré le: {datetime.now().strftime('%d/%m/%Y %H:%M')}", ln=True)
-    pdf.ln(10)
+    user_searches.setdefault(m.from_user.id, {})
+    await m.answer(get_panel_text(m, user_searches[m.from_user.id]), reply_markup=kb_main())
+
+@dp.message(Command("claim"))
+async def cmd_claim(m: types.Message):
+    # Logique simplifiée pour l'exemple
+    if "2RUDOFLQJG4IN" in m.text:
+        exp = (datetime.now() + timedelta(days=30)).strftime("%Y-%m-%dT%H:%M:%S")
+        cursor.execute("INSERT OR REPLACE INTO users VALUES (?,?)", (m.from_user.id, exp))
+        conn.commit()
+        await m.answer(f"✅ **Accès activé jusqu'au {exp.replace('T', ' ')}**")
+    else:
+        await m.answer("❌ Clé invalide.")
+
+@dp.callback_query(F.data.startswith("f_"))
+async def prompt_input(c: types.CallbackQuery, state: FSMContext):
+    field = c.data.split("_")[1]
+    await state.update_data(current_field=field)
+    await state.set_state(Form.waiting_input)
+    await c.message.answer(f"⌨️ Envoie la valeur pour : **{field}**")
+    await c.answer()
+
+@dp.message(Form.waiting_input)
+async def process_input(m: types.Message, state: FSMContext):
+    data = await state.get_data()
+    field = data.get("current_field")
     
-    pdf.set_fill_color(240, 240, 240)
-    for key, value in data.items():
-        pdf.set_font("Helvetica", "B", 11)
+    user_searches.setdefault(m.from_user.id, {})
+    user_searches[m.from_user.id][field] = m.text
+    
+    await state.clear()
+    await m.answer(f"✅ **{field}** enregistré.", reply_markup=kb_main())
+
+@dp.callback_query(F.data == "run")
+async def run_search(c: types.CallbackQuery):
+    data = user_searches.get(c.from_user.id, {})
+    if not data:
+        return await c.answer("❌ Aucun champ rempli !", show_alert=True)
+
+    loading = await c.message.answer("⚙️ **Recherche en cours...**")
+    await asyncio.sleep(1.5) # Simulation
+
+    res = (
+        "━━━━━━━━━━━━━━━━━━━━━\n"
+        "📊 **RESULTATS OSINT**\n"
+        "━━━━━━━━━━━━━━━━━━━━━\n\n"
+        "👤 **ÉTAT CIVIL**\n"
+        f"• Nom : {data.get('nom', 'N/A')}\n"
+        f"• Prénom : {data.get('prenom', 'N/A')}\n"
+        f"• Année : {data.get('annee', 'N/A')}\n\n"
+        "📞 **CONTACT**\n"
+        f"• Tel : {data.get('tel', 'N/A')}\n"
+        f"• Email : {data.get('email', 'N/A')}\n\n"
+        "🏠 **ADRESSE**\n"
+        f"• Ville : {data.get('ville', 'N/A')}\n"
+        "━━━━━━━━━━━━━━━━━━━━━\n"
+        "📄 Page 1/1"
+    )
+    
+    # Boutons sous le résultat (comme sur l'image)
+    res_kb = InlineKeyboardBuilder()
+    res_kb.button(text="📋 Copier", callback_data="copy")
+    res_kb.button(text="📩 Exporter", callback_data="export")
+    
+    await loading.edit_text(res, reply_markup=res_kb.as_markup())
+    await c.answer()
+
+@dp.callback_query(F.data == "clear")
+async def clear_data(c: types.CallbackQuery):
+    user_searches[c.from_user.id] = {}
+    await c.answer("🧹 Données effacées")
+    await c.message.edit_text(get_panel_text(c.message, {}), reply_markup=kb_main())
+
+# --- MAIN ---
+async def main():
+    print("Bot démarré...")
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass
         pdf.cell(50, 10, f" {key.upper()}", border=1, fill=True)
         pdf.set_font("Helvetica", "", 11)
         pdf.cell(0, 10, f" {value}", border=1, ln=True)
